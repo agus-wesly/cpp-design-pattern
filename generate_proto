@@ -1,0 +1,31 @@
+#!/bin/bash
+
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 <FILE_NAME>"
+    exit 1
+fi
+
+# Assuming the script is run inside `proto` folder 
+# And `conan install` command is already run
+source ../build/conanbuild.sh
+
+PROTO_FILE_NAME="$1.proto"
+GRPC_CPP_PLUGIN_CONAN="grpc_cpp_plugin"
+PROTOC=$(command -v protoc)
+
+if [ -z "$PROTOC" ]; then
+    echo "Error: protoc not found!"
+    exit 1
+fi
+
+GRPC_CPP_PLUGIN=$(which grpc_cpp_plugin 2>/dev/null || echo "$GRPC_CPP_PLUGIN_CONAN")
+
+if [ ! -f "$GRPC_CPP_PLUGIN" ]; then
+    echo "Error: gRPC plugin not found!"
+    exit 1
+fi
+
+$PROTOC -I ./ --grpc_out=./ --plugin=protoc-gen-grpc=$GRPC_CPP_PLUGIN $PROTO_FILE_NAME
+$PROTOC -I ./ --cpp_out=. $PROTO_FILE_NAME
+
+echo "Execution completed."

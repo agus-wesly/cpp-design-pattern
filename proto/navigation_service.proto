@@ -1,0 +1,23 @@
+syntax = "proto3";
+
+service NavigationService {
+  rpc StreamNavigationData(StreamRequest) returns (stream NavigationData) {}
+}
+
+message StreamRequest {}
+
+message DoubleField {
+  double value = 1;
+  bool is_valid = 2;
+}
+
+message NavigationData {
+  DoubleField latitude_dd = 1;
+  DoubleField longitude_dd = 2;
+  DoubleField heading_rad = 3;
+  DoubleField relative_speed_knots = 4;
+  DoubleField roll_rad = 5;
+  DoubleField pitch_rad = 6;
+  DoubleField drift_speed_mps = 7;
+  DoubleField drift_course_mps = 8;
+}

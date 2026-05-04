@@ -1,5 +1,6 @@
-#include <condition_variable>
 #include <csignal>
+#include <iostream>
+#include <condition_variable>
 #include <iostream>
 #include <mutex>
 #include <sys/socket.h>
@@ -11,71 +12,19 @@
 #include <string_view>
 #include <charconv>
 #include <assert.h>
-#include <thread>
 #include <atomic>
 #include <cmath>
 #include <deque>
 #include <optional>
-#include "navigation_service.grpc.pb.h"
 #include <grpc++/grpc++.h>
+#include <shared_mutex>
+#include <thread>
+#include "utils/message_queue/message_queue.inl"
 
-# define M_PI           3.14159265358979323846
-# define KNOTS_PER_MS   0.514444
+# define KNOTS_PER_MS 0.514444
 
 const char* IP = "127.0.0.1";
 constexpr int PORT = 5000;
-
-double degrees_to_radians(double degree) {
-    return degree * (M_PI/180);
-}
-
-enum SentenceType {
-    GP,
-    GS,
-    HE,
-    VE,
-    PA,
-    Unknown
-};
-
-struct GP_Sentence {
-    double latitude_ddm;
-    double longitude_ddm;
-};
-
-struct GS_Sentence {
-    double latitude_ddm;
-    double longitude_ddm;
-};
-
-struct HE_Sentence {
-    double heading_deg;
-};
-
-struct VE_Sentence {
-    double speed_kmph;
-    double speed_knots;
-    double heading_deg;
-};
-
-struct PA_Sentence {
-    double heading_deg;
-    double pitch_deg;
-    double roll_deg;
-};
-
-using SentencePayload = std::variant<
-GP_Sentence,
-    GS_Sentence,
-    HE_Sentence,
-    VE_Sentence,
-    PA_Sentence
-    >;
-
-    struct Sentence {
-        SentenceType type;
-        SentencePayload payload;
-    };
 
 struct DegDecMin {
     int degrees;
@@ -91,6 +40,26 @@ struct DegDecMin {
     }
 };
 
+double degrees_to_radians(double degree) {
+    return degree * (M_PI/180);
+}
+
+struct NavigationStateForClient {
+    template <typename T>
+        struct Field {
+            T value{};
+            bool is_valid = false;
+        };
+
+    Field<double> latitude_dd;
+    Field<double> longitude_dd;
+    Field<double> heading_rad;
+    Field<double> relative_speed_knots;
+    Field<double> roll_rad;
+    Field<double> pitch_rad;
+    Field<double> drift_speed_mps;
+    Field<double> drift_course_mps;
+};
 
 class DriftCalculator {
     public:
@@ -230,6 +199,66 @@ class DriftCalculator {
             return R * c;  // meters
         }
 };
+
+template <typename T>
+struct TimedValue {
+    T value;
+    std::chrono::steady_clock::time_point last_update;
+    bool valid = false;
+};
+
+struct LatitudeSources {
+    TimedValue<DegDecMin> fromGP;
+    TimedValue<DegDecMin> fromGS;
+};
+
+struct LongitudeSources {
+    TimedValue<DegDecMin> fromGP;
+    TimedValue<DegDecMin> fromGS;
+};
+
+struct HeadingSources {
+    TimedValue<double> fromPA;
+    TimedValue<double> fromHE;
+    TimedValue<double> fromVE;
+};
+
+enum SentenceType {
+    GP,
+    GS,
+    HE,
+    VE,
+    PA,
+    Unknown
+};
+
+struct GP_Sentence {
+    DegDecMin latitude_ddm;
+    DegDecMin longitude_ddm;
+};
+
+struct GS_Sentence {
+    DegDecMin latitude_ddm;
+    DegDecMin longitude_ddm;
+};
+
+struct HE_Sentence {
+    double heading_deg;
+};
+
+struct VE_Sentence {
+    double speed_kmph;
+    double speed_knots;
+    double heading_deg;
+};
+
+struct PA_Sentence {
+    double heading_deg;
+    double pitch_deg;
+    double roll_deg;
+};
+
+using SentencePayload = std::variant<GP_Sentence, GS_Sentence, HE_Sentence, VE_Sentence, PA_Sentence>;
 
 struct Parser {
     std::string_view sentence_sv;
@@ -478,44 +507,110 @@ struct Parser {
     }
 };
 
-template <typename T>
-struct TimedValue {
-    T value;
-    std::chrono::steady_clock::time_point last_update;
-    bool valid = false;
-};
+struct Sentence {
+    SentenceType type;
+    SentencePayload payload;
 
-struct LatitudeSources {
-    TimedValue<DegDecMin> fromGP;
-    TimedValue<DegDecMin> fromGS;
-};
+    static Sentence parse_from_char(char *raw_data)
+    {
+        Parser p(raw_data);
 
-struct LongitudeSources {
-    TimedValue<DegDecMin> fromGP;
-    TimedValue<DegDecMin> fromGS;
-};
+        try
+        {
+            p.verify_checksum();
+            std::string_view token_type = p.next_token();
 
-struct HeadingSources {
-    TimedValue<double> fromPA;
-    TimedValue<double> fromHE;
-    TimedValue<double> fromVE;
-};
+            if (token_type == "GP")
+            {
+                DegDecMin latitude = p.parse_latitude();
+                DegDecMin longitude = p.parse_longitude();
 
-struct NavigationStateForClient {
-    template <typename T>
-        struct Field {
-            T value{};
-            bool is_valid = false;
-        };
+                std::cout << "GP : " << latitude.degrees << " , " << latitude.minutes << " , " << latitude.direction << " , " << std::endl;
+                std::cout << longitude.degrees << " , " << longitude.minutes << " , " << longitude.direction << std::endl;
 
-    Field<double> latitude_dd;
-    Field<double> longitude_dd;
-    Field<double> heading_rad;
-    Field<double> relative_speed_knots;
-    Field<double> roll_rad;
-    Field<double> pitch_rad;
-    Field<double> drift_speed_mps;
-    Field<double> drift_course_mps;
+                return Sentence{
+                    .type = SentenceType::GP,
+                    .payload = GP_Sentence {
+                        .latitude_ddm = latitude,
+                        .longitude_ddm = longitude,
+                    },
+                };
+            }
+            else if (token_type == "GS")
+            {
+                auto longitude = p.parse_longitude();
+                auto latitude = p.parse_latitude();
+
+                std::cout << "GS : " << latitude.degrees << " , " << latitude.minutes << " , " << latitude.direction << " , " << std::endl;
+                std::cout << longitude.degrees << " , " << longitude.minutes << " , " << longitude.direction << std::endl;
+
+                return Sentence {
+                    .type = SentenceType::GS,
+                    .payload = GS_Sentence {
+                        .latitude_ddm = latitude,
+                        .longitude_ddm = longitude,
+                    }
+                };
+            }
+            else if (token_type == "HE")
+            {
+                double heading_degree = p.parse_heading(3);
+                std::cout << "HE : " << heading_degree << std::endl;
+                return Sentence {
+                    .type = SentenceType::HE, 
+                    .payload = HE_Sentence {
+                        .heading_deg = heading_degree
+                    }
+                };
+            }
+            else if (token_type == "VE")
+            {
+                double relative_speed_km_h = p.parse_relative_speed();
+                p.parse_expect_char('K');
+
+                double relative_speed_knots = p.parse_relative_speed();
+                p.parse_expect_char('N');
+
+                double heading_degree = p.parse_heading(2);
+                std::cout << "VE : " << relative_speed_km_h << " , " << relative_speed_knots << " , " << heading_degree << std::endl;
+                // NOTE(wesly): For now just use relative speed in knots
+                return Sentence{
+                    .type = SentenceType::VE,
+                    .payload = VE_Sentence {
+                        .speed_kmph = relative_speed_km_h,
+                        .speed_knots = relative_speed_knots,
+                        .heading_deg = heading_degree,
+                    }
+                };
+            }
+            else if (token_type == "PA")
+            {
+                double heading_degree = p.parse_heading(3);
+                double pitch_degree = p.parse_motion();
+                double roll_degree = p.parse_motion();
+
+                std::cout << "PA : " << heading_degree << " , " << pitch_degree << " , " << roll_degree << std::endl;
+                return Sentence {
+                    .type = SentenceType::PA,
+                    .payload = PA_Sentence {
+                        .heading_deg = heading_degree,
+                        .pitch_deg = pitch_degree,
+                        .roll_deg = roll_degree
+                    }
+                };
+            }
+            else 
+            {
+                throw std::runtime_error("Unexpected not recognized sentence");
+            }
+        }
+        catch (std::exception &e)
+        {
+            std::cerr << e.what() << std::endl;
+            // TODO(wesly): Do something when catching an exception
+            exit(69);
+        }
+    }
 };
 
 class NavigationStateBuffer {
@@ -712,16 +807,6 @@ struct CurrentNavigationState {
                     result.drift_speed_mps.is_valid = false;
                     result.drift_course_mps.is_valid = false;
                 } else {
-                    /*
-                     *
-                     - `double lat1`
-                     - `double lon1`
-                     - `double lat2`
-                     - `double lon2`
-                     - `double time_delta`
-                     - `double relative_speed`
-                     - `double heading`
-                     */
                     result.drift_course_mps.value = DriftCalculator::calculateDriftCourse(
                             prev_payload.latitude_dd.value,
                             prev_payload.longitude_dd.value,
@@ -732,16 +817,6 @@ struct CurrentNavigationState {
                             result.heading_rad.value
                             );
                     result.drift_course_mps.is_valid = true;
-
-                    /*
-                       - `double lat1`
-                       - `double lon1`
-                       - `double lat2`
-                       - `double lon2`
-                       - `double time_delta`
-                       - `double relative_speed`
-                       - `double heading`
-                       */
                     result.drift_speed_mps.value = DriftCalculator::calculateDriftSpeed(
                             prev_payload.latitude_dd.value,
                             prev_payload.longitude_dd.value,
@@ -761,8 +836,35 @@ struct CurrentNavigationState {
             return result;
         }
 
+        void update(const Sentence& sentence) {
+            std::visit([this](const auto& data) {
+                const auto now = std::chrono::steady_clock::now();
+                using T = std::decay_t<decltype(data)>;
+
+                if constexpr (std::is_same_v<T, GP_Sentence>) {
+                    this->update_position_from_GP(now, data.latitude_ddm, data.longitude_ddm);
+                }
+                else if constexpr (std::is_same_v<T, GS_Sentence>) {
+                    this->update_position_from_GP(now, data.latitude_ddm, data.longitude_ddm);
+                }
+                else if constexpr (std::is_same_v<T, PA_Sentence>) {
+                    this->update_heading_from_PA(now, data.heading_deg);
+                    this->update_pitch(now, data.pitch_deg);
+                    this->update_roll(now, data.roll_deg);
+                }
+                else if constexpr (std::is_same_v<T, HE_Sentence>) {
+                    this->update_heading_from_HE(now, data.heading_deg);
+                }
+                else if constexpr (std::is_same_v<T, VE_Sentence>) {
+                    this->update_relative_speed(now, data.speed_kmph);
+                    this->update_heading_from_VE(now, data.heading_deg);
+                }
+            }, sentence.payload);
+        }
+
 
     private:
+
         mutable std::mutex mutex;
 
         LatitudeSources latitude;
@@ -774,32 +876,109 @@ struct CurrentNavigationState {
         TimedValue<double> pitch;
 };
 
-struct UDPListener {
+struct AppState {
+    CurrentNavigationState navigation_state{};
+    // More...
+};
+
+struct ThreadSyncPrimitive {
+    std::shared_mutex navigation_state_mtx{};
+};
+
+class InterfaceReceiver {
     public:
-        std::atomic<bool>is_running;
+        virtual ~InterfaceReceiver() = default;
 
-        UDPListener(CurrentNavigationState *state): is_running(false), navigation_state(state) {}
+        virtual void start() = 0;
+        virtual void stop() = 0;
+};
 
-        ~UDPListener() {
-            stop();
+class Observer {
+    public:
+        virtual ~Observer() = default;
+        virtual void update_data() = 0;
+};
+
+class Observable {
+    public:
+        void notify_observers() {
+            for (auto& observer : this->observers_) {
+                this->threads_.emplace_back([observer] () {
+                    observer->update_data();
+                });
+            }
         }
 
-        bool start() {
-            if (is_running) {
+        void sync_threads() {
+            for (auto& thread: this->threads_) {
+                thread.join();
+            }
+            this->threads_.clear();
+        }
+
+        void add_observer(Observer* observer) {
+            this->observers_.push_back(observer);
+        }
+
+        virtual void remove_observer(Observer* observer) {
+            this->observers_.remove(observer);
+        }
+
+    private:
+        std::list<Observer*> observers_;
+        std::list<std::thread> threads_;
+};
+
+class InterfaceRawNavigationStateReceiver : public InterfaceReceiver {
+    public:
+        ~InterfaceRawNavigationStateReceiver() override = default;
+
+        virtual Sentence get_sentence() = 0;
+
+        virtual void start() = 0;
+
+        virtual void stop() = 0;
+
+        virtual void add_observer(Observer *observer) = 0;
+        
+        virtual void remove_observer(Observer *observer) = 0;
+};
+
+template<typename MessageT>
+class DataListener {
+public:
+    DataListener() = default;
+
+    MessageQueue<MessageT>* get_queue_() {
+        return &this->queue_;
+    }
+
+    void on_data_available(char* data) {
+        Sentence parsed = Sentence::parse_from_char(data);
+        this->queue_.push(std::move(parsed));
+    }
+private:
+    MessageQueue<MessageT> queue_{};
+};
+
+class RawNavigationStateSubscriber : public Observable, public InterfaceRawNavigationStateReceiver {
+    public:
+        RawNavigationStateSubscriber() {
+            if (this->is_running_) {
                 std::cerr << "UDP Listener already running" << std::endl;
-                return false;
+                return;
             }
 
-            sockfd = socket(AF_INET, SOCK_DGRAM, 0);
-            if (sockfd < 0) {
+            this->sockfd_ = socket(AF_INET, SOCK_DGRAM, 0);
+            if (this->sockfd_ < 0) {
                 std::cerr << "Failed to create socket" << std::endl;
-                return false;
+                return;
             }
 
             struct timeval tv;
             tv.tv_sec = 1;
             tv.tv_usec = 0;
-            setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+            setsockopt(this->sockfd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 
             struct sockaddr_in server_addr;
             memset(&server_addr, 0, sizeof(server_addr));
@@ -808,327 +987,135 @@ struct UDPListener {
 
             if (inet_pton(AF_INET, IP, &server_addr.sin_addr) <= 0) {
                 std::cerr << "Invalid address" << std::endl;
-                close(sockfd);
-                sockfd = -1;
-                return false;
+                close(this->sockfd_);
+                this->sockfd_ = -1;
+                return;
             }
 
-            if (bind(sockfd, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+            if (bind(this->sockfd_, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
                 std::cerr << "bind failed" << std::endl;
-                close(sockfd);
-                sockfd = -1;
-                return false;
+                close(this->sockfd_);
+                this->sockfd_ = -1;
+                return;
             }
 
-            is_running = true;
-            listener_thread = std::thread(&UDPListener::receive, this);
-            std::cout << "Listening via UDP into : " << IP << ":" << PORT << std::endl;
+            this->is_running_ = true;
 
-            return true;
-        }
+            std::thread t([this]() {
+                struct sockaddr_in sender_addr{};
+                socklen_t sender_len = sizeof(sender_addr);
+                while (this->is_running_) {
+                    char buff[1024];
+                    auto received = recvfrom(
+                            this->sockfd_, buff, sizeof(buff) - 1,
+                            0, (struct sockaddr*)&sender_addr, &sender_len);
 
-        void stop() {
-            if (is_running) {
-                is_running = false;
-                if (listener_thread.joinable()) {
-                    listener_thread.join();
-                }
-                if (sockfd >= 0) {
-                    close(sockfd);
-                    sockfd = -1;
-                }
-                std::cout << "UDP Listener stopped" << std::endl;
-            }
-        }
+                    if (received < 0) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                            continue;
+                        }
 
-    private:
-        int sockfd;
-        std::thread listener_thread;
-        CurrentNavigationState *navigation_state;
-
-        bool parseMessageIntoSentence(const char* message) {
-            Parser p(message);
-
-            try {
-                p.verify_checksum();
-                std::string_view token_type = p.next_token();
-
-                if (token_type == "GP") {
-                    DegDecMin latitude = p.parse_latitude();
-                    DegDecMin longitude = p.parse_longitude();
-
-                    std::cout << "GP : " << latitude.degrees << " , " << latitude.minutes << " , " << latitude.direction << " , " << std::endl;
-                    std::cout << longitude.degrees << " , " << longitude.minutes << " , " << longitude.direction << std::endl;
-
-                    // TODO(wesly): maybe move instead of copying ?
-                    navigation_state->update_position_from_GP(std::chrono::steady_clock::now(), latitude, longitude);
-
-                } else if (token_type == "GS") {
-                    auto longitude = p.parse_longitude();
-                    auto latitude = p.parse_latitude();
-
-                    std::cout << "GS : " << latitude.degrees << " , " << latitude.minutes << " , " << latitude.direction << " , " << std::endl;
-                    std::cout << longitude.degrees << " , " << longitude.minutes << " , " << longitude.direction << std::endl;
-
-                    navigation_state->update_position_from_GS(std::chrono::steady_clock::now(), latitude, longitude);
-
-                } else if (token_type == "HE") {
-                    double heading_degree = p.parse_heading(3);
-                    std::cout << "HE : " << heading_degree << std::endl;
-                    navigation_state->update_heading_from_HE(std::chrono::steady_clock::now(), heading_degree);
-
-                } else if (token_type == "VE") {
-                    double relative_speed_km_h = p.parse_relative_speed();
-                    p.parse_expect_char('K');
-
-                    double relative_speed_knots = p.parse_relative_speed();
-                    p.parse_expect_char('N');
-
-                    // NOTE(wesly): For now just use relative speed in knots
-                    navigation_state->update_relative_speed(std::chrono::steady_clock::now(), relative_speed_knots);
-
-                    double heading_degree = p.parse_heading(2);
-                    std::cout << "VE : " << relative_speed_km_h << " , " << relative_speed_knots << " , " << heading_degree << std::endl;
-                    navigation_state->update_heading_from_VE(std::chrono::steady_clock::now(), heading_degree);
-
-                } else if (token_type == "PA") {
-                    double heading_degree = p.parse_heading(3);
-                    navigation_state->update_heading_from_PA(std::chrono::steady_clock::now(), heading_degree);
-
-                    double pitch_degree = p.parse_motion();
-                    double roll_degree = p.parse_motion();
-                    navigation_state->update_pitch(std::chrono::steady_clock::now(), pitch_degree);
-                    navigation_state->update_roll(std::chrono::steady_clock::now(), roll_degree);
-
-                    std::cout << "PA : " << heading_degree << " , " << pitch_degree << " , " << roll_degree << std::endl;
-                }
-                return true;
-
-            } catch(std::exception &e) {
-                std::cerr << e.what() << std::endl;
-                return false;
-            }
-        }
-
-        void receive() {
-            struct sockaddr_in sender_addr{};
-            socklen_t sender_len = sizeof(sender_addr);
-
-            while (is_running) {
-                char buff[1024];
-                auto recevied = recvfrom(
-                        sockfd, buff, sizeof(buff) - 1,
-                        0, (struct sockaddr*)&sender_addr, &sender_len);
-
-                if (recevied < 0) {
-                    if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                        std::cerr << "Error receiving UDP packet: " << strerror(errno) << std::endl;
                         continue;
                     }
 
-                    std::cerr << "Error receiving UDP packet: " << strerror(errno) << std::endl;
-                    continue;
+                    buff[received] = '\0';
+
+                    this->listener_.on_data_available(buff);
                 }
+            }); t.detach();
+            std::cout << "Listening via UDP into : " << IP << ":" << PORT << std::endl;
+        }
 
-                buff[recevied] = '\0';
+        void start() override {
+            std::cout << "UDP Subscriber [Raw Navigation State ] Ready ..." << std::endl;
 
-                if (!parseMessageIntoSentence(buff)) {
-                    std::cerr << "Failed to parse " << buff << std::endl;
-                };
+            Sentence buff{};
+            while (this->listener_.get_queue_()->wait_and_pop(buff)) {
+                this->sync_threads();
+                this->sentence_ = buff;
+                this->notify_observers();
             }
         }
+
+        void stop() {
+            this->is_running_ = false;
+        }
+
+        void add_observer(Observer* observer) {
+            Observable::add_observer(observer);
+        }
+
+        void remove_observer(Observer* observer) {
+            Observable::remove_observer(observer);
+        }
+
+        Sentence get_sentence() {
+            return this->sentence_;
+        }
+
+    private:
+        std::atomic<bool> is_running_ = false;
+        int sockfd_{};
+        Sentence sentence_{};
+        DataListener<Sentence> listener_;
+        void process_message(const char* message);
 };
 
-std::atomic<bool> keep_running{true};
 
-void signalHandler(int signal) {
-    if (signal == SIGINT) {
-        std::cout << "Received SIGINT, shutting down..." << std::endl;
-        keep_running = false;
-    }
-}
+class RawNavigationHandler : public Observer {
+    public:
+        RawNavigationHandler (
+            InterfaceRawNavigationStateReceiver *observable,
+            AppState &app_state,
+            ThreadSyncPrimitive &thread_sync_primitive
+        ) : observable_(observable), app_state_(app_state), thread_sync_primitive_(thread_sync_primitive) {}
 
-class NavigationServiceImpl final : public NavigationService::Service {
-public:
-    NavigationServiceImpl(CurrentNavigationState& current_state, NavigationStateBuffer &navigation_state_buffer)
-        : current_state_(current_state), navigation_state_buffer_(navigation_state_buffer) {
-    }
-    
-    grpc::Status StreamNavigationData(
-        grpc::ServerContext* context,
-        const StreamRequest* request,
-        grpc::ServerWriter<NavigationData>* writer
-        ) {
-        const int interval_seconds = 3;
-
-        std::cout << "Client connected for streaming (interval: " 
-            << interval_seconds << "s)" << std::endl;
-
-        std::optional<NavigationStateForClient> last_sent;
-
-        while (!context->IsCancelled()) {
-            if (!navigation_state_buffer_.wait_for_new_data(std::chrono::seconds(1))) {
-                continue;
-            }
-
-            auto state_opt = navigation_state_buffer_.get_last();
-            if (!state_opt.has_value()) {
-                continue;
-            }
-
-            auto state = state_opt.value();
-
-            if (last_sent.has_value() && 
-                state.latitude_dd.value == last_sent->latitude_dd.value &&
-                state.longitude_dd.value == last_sent->longitude_dd.value) {
-                continue;
-            }
-
-            NavigationData proto_data;
-            convertToProto(state, &proto_data);
-
-            if (!writer->Write(proto_data)) {
-                std::cout << "Client disconnected" << std::endl;
-                break;
-            }
-
-            last_sent = state;
-            std::cout << "Sent navigation data to client" << std::endl;
+        void update_data() {
+            std::lock_guard(this->thread_sync_primitive_.navigation_state_mtx);
+            Sentence new_data = this->observable_->get_sentence();
+            this->app_state_.navigation_state.update(new_data);
         }
 
-        return grpc::Status::OK;
-    }
-    
-private:
-    CurrentNavigationState& current_state_;
-    NavigationStateBuffer &navigation_state_buffer_;
-
-    void convertToProto(const NavigationStateForClient& state, NavigationData* proto_data) {
-        auto *lat = proto_data->mutable_latitude_dd();
-        lat->set_is_valid(state.latitude_dd.is_valid);
-        if (state.latitude_dd.is_valid) 
-            lat->set_value(state.latitude_dd.value);
-
-        auto *longitude = proto_data->mutable_longitude_dd();
-        longitude->set_is_valid(state.longitude_dd.is_valid);
-        if (state.longitude_dd.is_valid)
-            longitude->set_value(state.longitude_dd.value);
-
-        auto *heading = proto_data->mutable_heading_rad();
-        heading->set_is_valid(state.heading_rad.is_valid);
-        if (state.heading_rad.is_valid)
-            heading->set_value(state.heading_rad.value);
-
-        auto *relative_speed = proto_data->mutable_relative_speed_knots();
-        relative_speed->set_is_valid(state.relative_speed_knots.is_valid);
-        if (state.relative_speed_knots.is_valid)
-            relative_speed->set_value(state.relative_speed_knots.value);
-
-        auto *roll_rad = proto_data->mutable_roll_rad();
-        roll_rad->set_is_valid(state.roll_rad.is_valid);
-        if (state.roll_rad.is_valid)
-            roll_rad->set_value(state.roll_rad.value);
-
-        auto *pitch_rad = proto_data->mutable_pitch_rad();
-        pitch_rad->set_is_valid(state.pitch_rad.is_valid);
-        if (state.pitch_rad.is_valid)
-            pitch_rad->set_value(state.pitch_rad.value);
-
-        auto* drift_speed = proto_data->mutable_drift_speed_mps();
-        drift_speed->set_is_valid(state.drift_speed_mps.is_valid);
-        if (state.drift_speed_mps.is_valid)
-            drift_speed->set_value(state.drift_speed_mps.value);
-
-        auto* drift_course = proto_data->mutable_drift_course_mps();
-        drift_course->set_is_valid(state.drift_course_mps.is_valid);
-        if (state.drift_course_mps.is_valid)
-            drift_course->set_value(state.drift_course_mps.value);
-    }
+    private:
+        InterfaceRawNavigationStateReceiver* observable_;
+        AppState &app_state_;
+        ThreadSyncPrimitive &thread_sync_primitive_;
 };
 
-class GRPCServer {
-public:
-    GRPCServer(const std::string& server_address, CurrentNavigationState& current_state, NavigationStateBuffer &navigation_state_buffer)
-        : server_address_(server_address), service_(std::make_unique<NavigationServiceImpl>(current_state, navigation_state_buffer)) {} ;
-
-    ~GRPCServer(){
-        stop();
-    }
-    
-    void run() {
-        grpc::ServerBuilder builder;
-
-        builder.AddListeningPort(server_address_, grpc::InsecureServerCredentials());
-
-        builder.RegisterService(service_.get());
-
-        server_ = builder.BuildAndStart();
-
-        if (server_) {
-            std::cout << "gRPC Server listening on " << server_address_ << std::endl;
-            server_->Wait();
-        } else {
-            std::cerr << "Failed to start gRPC server" << std::endl;
+class BackendInterfaceThreadsContainer {
+    public:
+        static void raw_navigation_state_receiver_thread(
+            InterfaceRawNavigationStateReceiver *raw_navigation_state_receiver,
+            AppState &app_state,
+            ThreadSyncPrimitive &thread_sync_primitive
+        ) 
+        {
+            RawNavigationHandler raw_navigation_handler(
+                raw_navigation_state_receiver,
+                app_state,
+                thread_sync_primitive
+            );
+            raw_navigation_state_receiver->add_observer(&raw_navigation_handler);
+            raw_navigation_state_receiver->start();
         }
-    }
-    
-    void stop() {
-        if (server_) {
-            std::cout << "Stopping gRPC server..." << std::endl;
-            server_->Shutdown();
-        }
-    }
-
-private:
-    void runServer();
-    
-    std::string server_address_;
-    std::unique_ptr<NavigationServiceImpl> service_;
-    std::unique_ptr<grpc::Server> server_;
-    std::thread server_thread_;
-    std::atomic<bool> running_{false};
 };
 
 int main() {
-    signal(SIGINT, signalHandler);
+    AppState app_state{};
 
-    CurrentNavigationState navigation_state{};
-    NavigationStateBuffer navigation_state_buffer{};
+    ThreadSyncPrimitive thread_sync_primitive{};
+    RawNavigationStateSubscriber raw_navigation_state_subscriber{};
 
-    UDPListener udpListener(&navigation_state);
-    if (!udpListener.start()) {
-        std::cerr << "Failed to start UDPListener" << std::endl;
-        return EXIT_FAILURE;
-    }
+    std::thread raw_navigation_state_subscriber_thread
+    (
+        BackendInterfaceThreadsContainer::raw_navigation_state_receiver_thread,
+        &raw_navigation_state_subscriber,
+        std::ref(app_state),
+        std::ref(thread_sync_primitive)
+    );
 
-    std::string grpc_address = "0.0.0.0:50051";
-    GRPCServer grpc_server(grpc_address, navigation_state, navigation_state_buffer);
-    std::thread grpc_thread([&]() {
-            grpc_server.run(); 
-    });
-
-    auto last_time = std::chrono::steady_clock::now();
-    while (keep_running) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed_time = std::chrono::duration_cast<std::chrono::seconds>(now - last_time).count();
-
-        if (elapsed_time > 3) {
-            last_time = now;
-
-            NavigationStateForClient client_payload = navigation_state.generate_navigation_for_client(now, navigation_state_buffer, elapsed_time);
-            navigation_state_buffer.push(client_payload);
-
-            if (client_payload.latitude_dd.is_valid)
-                std::cout << "Generated and pushed navigation data" << std::endl;
-        }
-    }
-
-    grpc_server.stop();
-    if (grpc_thread.joinable()) {
-        grpc_thread.join();
-    }
-
-    udpListener.stop();
+    raw_navigation_state_subscriber_thread.join(); 
 
     return EXIT_SUCCESS;
 }
