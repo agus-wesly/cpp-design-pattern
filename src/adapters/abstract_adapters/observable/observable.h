@@ -14,6 +14,6 @@ class Observable {
         virtual void remove_observer(Observer* observer);
 
     private:
-        std::list<Observer*> observers_;
-        std::list<std::thread> threads_;
+        std::list<Observer*> observers_{};
+        std::list<std::thread> threads_{};
 };

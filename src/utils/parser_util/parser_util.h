@@ -5,7 +5,7 @@
 
 struct Parser {
     public:
-        std::string_view sentence_sv;
+        std::string_view sentence_sv{};
         Parser(const char *input);
 
         void verify_checksum(); 

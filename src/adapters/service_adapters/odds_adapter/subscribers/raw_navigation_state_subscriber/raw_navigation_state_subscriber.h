@@ -23,6 +23,6 @@ class RawNavigationStateSubscriber : public Observable, public InterfaceRawNavig
         std::atomic<bool> is_running_ = false;
         int sockfd_{};
         Sentence sentence_{};
-        DataListener<Sentence> listener_;
+        DataListener<Sentence> listener_{};
         void process_message(const char* message);
 };

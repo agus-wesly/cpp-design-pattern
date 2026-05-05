@@ -18,22 +18,22 @@ struct NavigationStateForClient {
             bool is_valid = false;
         };
 
-    Field<double> latitude_dd;
-    Field<double> longitude_dd;
-    Field<double> heading_rad;
-    Field<double> relative_speed_knots;
-    Field<double> roll_rad;
-    Field<double> pitch_rad;
-    Field<double> drift_speed_mps;
-    Field<double> drift_course_mps;
+    Field<double> latitude_dd{};
+    Field<double> longitude_dd{};
+    Field<double> heading_rad{};
+    Field<double> relative_speed_knots{};
+    Field<double> roll_rad{};
+    Field<double> pitch_rad{};
+    Field<double> drift_speed_mps{};
+    Field<double> drift_course_mps{};
 };
 
 class NavigationStateBuffer {
     private:
-        std::deque<NavigationStateForClient> buffer;
+        std::deque<NavigationStateForClient> buffer{};
         const size_t max_size = 10;
-        mutable std::mutex mutex;
-        std::condition_variable cv;
+        mutable std::mutex mutex{};
+        std::condition_variable cv{};
 
     public:
         void push(const NavigationStateForClient& state) {
@@ -62,24 +62,24 @@ class NavigationStateBuffer {
 template <typename T>
 struct TimedValue {
     T value;
-    std::chrono::steady_clock::time_point last_update;
+    std::chrono::steady_clock::time_point last_update{};
     bool valid = false;
 };
 
 struct LatitudeSources {
-    TimedValue<DegDecMin> fromGP;
-    TimedValue<DegDecMin> fromGS;
+    TimedValue<DegDecMin> fromGP{};
+    TimedValue<DegDecMin> fromGS{};
 };
 
 struct LongitudeSources {
-    TimedValue<DegDecMin> fromGP;
-    TimedValue<DegDecMin> fromGS;
+    TimedValue<DegDecMin> fromGP{};
+    TimedValue<DegDecMin> fromGS{};
 };
 
 struct HeadingSources {
-    TimedValue<double> fromPA;
-    TimedValue<double> fromHE;
-    TimedValue<double> fromVE;
+    TimedValue<double> fromPA{};
+    TimedValue<double> fromHE{};
+    TimedValue<double> fromVE{};
 };
 
 struct CurrentNavigationState {
@@ -306,13 +306,13 @@ struct CurrentNavigationState {
 
         mutable std::mutex mutex;
 
-        LatitudeSources latitude;
-        LongitudeSources longitude;
-        HeadingSources heading;
+        LatitudeSources latitude{};
+        LongitudeSources longitude{};
+        HeadingSources heading{};
 
-        TimedValue<double> relative_speed;
-        TimedValue<double> roll;
-        TimedValue<double> pitch;
+        TimedValue<double> relative_speed{};
+        TimedValue<double> roll{};
+        TimedValue<double> pitch{};
 };
 
 struct AppState {
