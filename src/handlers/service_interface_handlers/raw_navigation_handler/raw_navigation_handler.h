@@ -18,6 +18,6 @@ class RawNavigationHandler : public Observer {
 
     private:
         InterfaceRawNavigationStateReceiver* observable_{};
-        AppState &app_state;
-        ThreadSyncPrimitive &thread_sync_primitive;
+        AppState &app_state_;
+        ThreadSyncPrimitive &thread_sync_primitive_;
 };
